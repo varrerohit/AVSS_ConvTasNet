@@ -556,8 +556,11 @@ def process_video(input_file, output_path, number_of_speakers, detect_every_N_fr
     # Initialize Video Model
     videomodel = video(**config['video_model'])
     if video_weights and os.path.exists(video_weights):
-        pretrain = torch.load(video_weights, map_location='cpu')['model_state_dict']
-        videomodel = update_parameter(videomodel, pretrain)
+        if os.path.getsize(video_weights) < 1000:
+            print(f"[Warning] Video pretrain file '{video_weights}' appears to be a Git LFS pointer. Skipping video weights load.")
+        else:
+            pretrain = torch.load(video_weights, map_location='cpu', weights_only=False)['model_state_dict']
+            videomodel = update_parameter(videomodel, pretrain)
     videomodel.to(device)
     videomodel.eval()
     
@@ -566,7 +569,7 @@ def process_video(input_file, output_path, number_of_speakers, detect_every_N_fr
     
     if audio_weights and os.path.exists(audio_weights):
         print(f"[System] Loading audio weights from: {audio_weights}")
-        state_dict = torch.load(audio_weights, map_location='cpu')
+        state_dict = torch.load(audio_weights, map_location='cpu', weights_only=False)
         if 'state_dict' in state_dict:
             state_dict = state_dict['state_dict']
         audiomodel = load_state_dict_in(audiomodel, state_dict)

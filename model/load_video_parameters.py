@@ -7,7 +7,7 @@ LastEditTime: 2021-04-04 11:43:28
 import sys
 sys.path.append('../../')
 import torch
-from model.Wujian_Model.video_model import video
+from model.video_model import video
 
 
 
