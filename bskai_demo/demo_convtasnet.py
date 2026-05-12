@@ -1,3 +1,11 @@
+"""
+Offline Audio-Visual Speech Separation using AV-ConvTasNet and BlueSkeye SDK.
+
+This script separates speech from multiple speakers in a video. It uses the BlueSkeye
+SDK for face tracking, extracts mouth regions, processes the video stream with a ResNet18
+frontend, and uses the AV-ConvTasNet model to estimate the isolated audio sources.
+"""
+
 import warnings
 warnings.filterwarnings("ignore")
 import os
@@ -7,10 +15,22 @@ import gc
 import torch
 import torch.nn.functional as F
 import yaml
-import json
+import numpy as np
+import cv2
+from PIL import Image
+from moviepy import VideoFileClip, AudioFileClip, ImageSequenceClip
+from collections import deque                                                 
+from skimage import transform as tf
+import torchaudio
 
 # Add AV-ConvTasNet to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from model.av_model import AV_model
+from model.video_model import video
+
+# Prevent python from writing .pyc files
+sys.dont_write_bytecode = True
 
 # ==========================================
 # HYPERPARAMETERS & SETTINGS
@@ -24,15 +44,18 @@ MOUTH_CROP_HEIGHT = 112
 MOUTH_CROP_WIDTH = 112  
 
 # --- APPLE SILICON MPS PATCH ---
+# Fallbacks for pooling layers to support Apple Silicon MPS
 _orig_adaptive_avg_pool1d = F.adaptive_avg_pool1d
 _orig_adaptive_avg_pool2d = F.adaptive_avg_pool2d
 
 def _mps_safe_adaptive_avg_pool1d(input, output_size):
+    """Safe adaptive_avg_pool1d wrapper for MPS."""
     if input.device.type == 'mps':
         return _orig_adaptive_avg_pool1d(input.cpu(), output_size).to(input.device)
     return _orig_adaptive_avg_pool1d(input, output_size)
 
 def _mps_safe_adaptive_avg_pool2d(input, output_size):
+    """Safe adaptive_avg_pool2d wrapper for MPS."""
     if input.device.type == 'mps':
         return _orig_adaptive_avg_pool2d(input.cpu(), output_size).to(input.device)
     return _orig_adaptive_avg_pool2d(input, output_size)
@@ -40,23 +63,20 @@ def _mps_safe_adaptive_avg_pool2d(input, output_size):
 F.adaptive_avg_pool1d = _mps_safe_adaptive_avg_pool1d
 F.adaptive_avg_pool2d = _mps_safe_adaptive_avg_pool2d
 
-import numpy as np
-import cv2
-from PIL import Image, ImageDraw
-from moviepy import VideoFileClip, AudioFileClip, ImageSequenceClip
-from collections import deque                                                 
-from skimage import transform as tf
-import torchaudio
-
-from model.av_model import AV_model
-from model.video_model import video
-
-sys.dont_write_bytecode = True
-
 # ==========================================
 # MODEL LOAD UTILS
 # ==========================================
 def load_state_dict_in(model, pretrained_dict):
+    """
+    Loads pretrained weights into the AV-ConvTasNet model by filtering specific keys.
+    
+    Args:
+        model (nn.Module): The target AV model.
+        pretrained_dict (dict): The loaded state dictionary.
+        
+    Returns:
+        nn.Module: The model with loaded weights.
+    """
     model_dict = model.state_dict()
     update_dict = {}
     for k, v in pretrained_dict.items():
@@ -67,6 +87,16 @@ def load_state_dict_in(model, pretrained_dict):
     return model
 
 def update_parameter(model, pretrained_dict):
+    """
+    Updates the video ResNet18 parameters with pretrained weights, parsing nested keys.
+    
+    Args:
+        model (nn.Module): The video embedding model.
+        pretrained_dict (dict): The loaded state dictionary.
+        
+    Returns:
+        nn.Module: The updated model with frozen parameters.
+    """
     model_dict = model.state_dict()
     update_dict = {}
     for k, v in pretrained_dict.items():
@@ -79,6 +109,8 @@ def update_parameter(model, pretrained_dict):
             update_dict[k_] = v
     model_dict.update(update_dict)
     model.load_state_dict(model_dict)
+    
+    # Freeze video parameters during inference
     for p in model.parameters():
         p.requires_grad = False
     return model
@@ -87,11 +119,16 @@ def update_parameter(model, pretrained_dict):
 # PREPROCESSING UTILS
 # ==========================================
 def CenterCrop(batch_img, size):
-    '''
-       Crop the center of image
-       batch image: B x D x H x W (channel = 1, D = depth)
-       size: (H x W)
-    '''
+    """
+    Crops the center of a batched image sequence.
+    
+    Args:
+        batch_img (np.ndarray): Image tensor (B, D, H, W).
+        size (tuple): Target (Height, Width).
+        
+    Returns:
+        np.ndarray: Centered crop.
+    """
     h, w = batch_img[0][0].shape[0], batch_img[0][0].shape[1]
     th, tw = size
     img = np.zeros((len(batch_img), len(batch_img[0]), th, tw))
@@ -102,16 +139,31 @@ def CenterCrop(batch_img, size):
     return img
 
 def ColorNormalize(batch_img):
-    '''
-        Normal the image value
-        batch image: B x D x H x W
-    '''
+    """
+    Normalizes image values to have zero mean and specific variance.
+    
+    Args:
+        batch_img (np.ndarray): Image tensor.
+        
+    Returns:
+        np.ndarray: Normalized image tensor.
+    """
     mean = 0.361858
     std = 0.147485
     batch_img = (batch_img - mean) / std
     return batch_img
 
 def init_sdk(sdk_path, license_path):
+    """
+    Initializes the BlueSkeye SDK.
+    
+    Args:
+        sdk_path (str): Path to SDK.
+        license_path (str): Path to SDK license.
+        
+    Returns:
+        tuple: (api_instance, image_type_constant)
+    """
     sys.path.insert(0, os.path.join(sdk_path, "python"))
     if "BSocial" in sdk_path:
         from BMBSocial import BMBSocialAPI, BSocialImageType
@@ -128,6 +180,7 @@ def init_sdk(sdk_path, license_path):
     return api, image_type
 
 def linear_interpolate(landmarks, start_idx, stop_idx):
+    """Linearly interpolates landmarks between indices."""
     start_landmarks = landmarks[start_idx]
     stop_landmarks = landmarks[stop_idx]
     delta = stop_landmarks - start_landmarks
@@ -136,6 +189,7 @@ def linear_interpolate(landmarks, start_idx, stop_idx):
     return landmarks
 
 def warp_img(src, dst, img, std_size):
+    """Applies a similarity transform to warp the image based on landmarks."""
     tform = tf.estimate_transform('similarity', src, dst) 
     warped = tf.warp(img, inverse_map=tform.inverse, output_shape=std_size) 
     warped = warped * 255 
@@ -143,12 +197,14 @@ def warp_img(src, dst, img, std_size):
     return warped, tform
 
 def apply_transform(transform, img, std_size):
+    """Applies a pre-computed transform to an image."""
     warped = tf.warp(img, inverse_map=transform.inverse, output_shape=std_size)
     warped = warped * 255 
     warped = warped.astype('uint8')
     return warped
 
 def cut_patch(img, landmarks, height, width, threshold=5):
+    """Crops a patch around the center of the given landmarks."""
     center_x, center_y = np.mean(landmarks, axis=0)
     if center_y - height < 0: center_y = height                                                    
     if center_y - height < 0 - threshold: raise Exception('too much bias in height')                           
@@ -164,15 +220,18 @@ def cut_patch(img, landmarks, height, width, threshold=5):
     return cutted_img
 
 def convert_bgr2gray(data):
+    """Converts a sequence of BGR images to grayscale."""
     return np.stack([cv2.cvtColor(_, cv2.COLOR_BGR2GRAY) for _ in data], axis=0)
 
 def save2npz(filename, data=None):
+    """Saves data array to a compressed NPZ file."""
     assert data is not None, "data is {}".format(data)
     if not os.path.exists(os.path.dirname(filename)):
         os.makedirs(os.path.dirname(filename))
     np.savez_compressed(filename, data=data)
 
 def read_video(filename):
+    """Yields RGB frames from a video file."""
     cap = cv2.VideoCapture(filename)
     while cap.isOpened():
         ret, frame = cap.read()
@@ -182,6 +241,7 @@ def read_video(filename):
     cap.release()
 
 def bb_intersection_over_union(boxA, boxB):
+    """Calculates Intersection over Union for speaker tracking."""
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
     xB = min(boxA[2], boxB[2])
@@ -196,6 +256,21 @@ def bb_intersection_over_union(boxA, boxB):
 # 1. FACE DETECTION (STREAMING MEMORY)
 # ==========================================
 def detectface(video_input_path, output_path, detect_every_N_frame, scalar_face_detection, number_of_speakers, api, image_type):
+    """
+    Tracks and extracts faces using the BlueSkeye SDK.
+    
+    Args:
+        video_input_path (str): Input video path.
+        output_path (str): Output directory.
+        detect_every_N_frame (int): Detection interval.
+        scalar_face_detection (float): Bounding box scaler.
+        number_of_speakers (int): Number of speakers.
+        api: SDK instance.
+        image_type: SDK image format.
+        
+    Returns:
+        str: CSV file path linking video to speakers.
+    """
     print('[System] Running Tracking on Apple Silicon via SDK')
     os.makedirs(os.path.join(output_path, 'faces'), exist_ok=True)
     os.makedirs(os.path.join(output_path, 'landmark'), exist_ok=True)
@@ -257,6 +332,7 @@ def detectface(video_input_path, output_path, detect_every_N_frame, scalar_face_
                 landmarks_dic[j].append(preds)
                 boxes_dic[j].append(box)
         else:
+            # Re-identify speakers using IoU between frames
             matched_speakers = set()
             speaker_boxes = [None] * number_of_speakers
             speaker_lnds = [None] * number_of_speakers
@@ -345,6 +421,23 @@ def detectface(video_input_path, output_path, detect_every_N_frame, scalar_face_
 # 2. MOUTH CROP 
 # ==========================================
 def crop_patch_logic(mean_face_landmarks, video_pathname, landmarks, window_margin, start_idx, stop_idx, crop_height, crop_width, STD_SIZE=(256, 256)):
+    """
+    Main logic to crop aligned mouth patches.
+    
+    Args:
+        mean_face_landmarks (np.ndarray): Mean face template for affine alignment.
+        video_pathname (str): Input video path.
+        landmarks (list): Detected landmarks for each frame.
+        window_margin (int): Frame smoothing window length.
+        start_idx (int): Mouth landmark start index (48).
+        stop_idx (int): Mouth landmark end index (68).
+        crop_height (int): Target crop height.
+        crop_width (int): Target crop width.
+        STD_SIZE (tuple): Base warp dimensions.
+        
+    Returns:
+        np.ndarray: Cropped sequence (T, H, W, 3).
+    """
     stablePntsIDs = [33, 36, 39, 42, 45]
     q_frame, q_landmarks = deque(), deque()
     sequence = []
@@ -366,6 +459,7 @@ def crop_patch_logic(mean_face_landmarks, video_pathname, landmarks, window_marg
         q_landmarks.append(clean_landmarks[frame_idx])
         q_frame.append(frame)
         
+        # Sliding window smoothing for stable warping
         if len(q_frame) == window_margin:
             smoothed_landmarks = np.mean(q_landmarks, axis=0)
             cur_landmarks = q_landmarks.popleft()
@@ -392,6 +486,7 @@ def crop_patch_logic(mean_face_landmarks, video_pathname, landmarks, window_marg
     return np.array(sequence) if len(sequence) > 0 else None
 
 def landmarks_interpolate(landmarks):
+    """Fills missing landmarks using linear interpolation."""
     valid_frames_idx = [idx for idx, _ in enumerate(landmarks) if _ is not None]
     if not valid_frames_idx: return None
     for idx in range(1, len(valid_frames_idx)):
@@ -406,6 +501,17 @@ def landmarks_interpolate(landmarks):
     return landmarks
 
 def crop_mouth(video_direc, landmark_direc, filename_path, save_direc, convert_gray=False, testset_only=False):
+    """
+    Orchestrates the mouth ROI extraction for all speakers.
+    
+    Args:
+        video_direc (str): Source video directory.
+        landmark_direc (str): Source landmark directory.
+        filename_path (str): Video ID registry list.
+        save_direc (str): Output directory for ROIs.
+        convert_gray (bool): Convert cropped mouth to grayscale.
+        testset_only (bool): If True, process test set only.
+    """
     lines = open(filename_path).read().splitlines()
     lines = list(filter(lambda x: 'test' in x, lines)) if testset_only else lines
 
@@ -438,6 +544,7 @@ def crop_mouth(video_direc, landmark_direc, filename_path, save_direc, convert_g
         if mean_face_landmarks is not None:
             sequence = crop_patch_logic(mean_face_landmarks, video_pathname, preprocessed_landmarks, 12, 48, 68, MOUTH_CROP_HEIGHT, MOUTH_CROP_WIDTH)
         else:
+            # Fallback for basic unaligned crop if no mean face template
             frame_gen = read_video(video_pathname)
             sequence = []
             for frame_idx, frame in enumerate(frame_gen):
@@ -456,14 +563,27 @@ def crop_mouth(video_direc, landmark_direc, filename_path, save_direc, convert_g
 # ==========================================
 def process_single_chunk_isolated(audiomodel, videomodel, mix_chunk, roi_chunk, device):
     """
+    Executes model inference for a single window isolated from the main graph memory.
+    
     This function forces local variables to be destroyed immediately upon return.
-    It returns a pure NumPy array, severing all hidden ties to the PyTorch Graph.
+    It returns a pure NumPy array, severing all hidden ties to the PyTorch Graph,
+    which is essential for Apple Silicon MPS stability.
+    
+    Args:
+        audiomodel (nn.Module): AV-ConvTasNet separation model.
+        videomodel (nn.Module): Video ResNet18 extraction model.
+        mix_chunk (torch.Tensor): Audio mixture segment.
+        roi_chunk (np.ndarray): Video ROI segment.
+        device (torch.device): Compute device.
+        
+    Returns:
+        np.ndarray: Evaluated speech representation.
     """
     # 1. Send tensors to GPU
     mix_input = mix_chunk[None].to(device)  # [1, T]
     
-    # AV-ConvTasNet processing
-    # roi_chunk shape is (T, H, W) -> Bx1xDxHxW -> (1, 1, T, 112, 112)
+    # AV-ConvTasNet expects video shape: (B, 1, D, H, W)
+    # roi_chunk shape is (T, H, W)
     mouth = roi_chunk[None]
     mouth = CenterCrop(mouth, (112, 112))
     mouth = ColorNormalize(mouth)
@@ -478,7 +598,7 @@ def process_single_chunk_isolated(audiomodel, videomodel, mix_chunk, roi_chunk, 
     # 3. Pull back to CPU
     numpy_result = est_sources.detach().cpu().numpy().copy()
     
-    # 4. Cleanup
+    # 4. Explicit Memory Cleanup
     del est_sources
     del mouth_emb
     del mix_input
@@ -490,6 +610,7 @@ def process_single_chunk_isolated(audiomodel, videomodel, mix_chunk, roi_chunk, 
 # 4. VIDEO PIPELINE 
 # ==========================================
 def convert_video_fps(input_file, output_file, target_fps=25):
+    """Ensures input video matches target extraction FPS."""
     video = VideoFileClip(input_file)
     if video.fps != target_fps:
         video.write_videofile(output_file, fps=target_fps, codec='libx264', audio_codec='aac', logger=None)
@@ -499,11 +620,13 @@ def convert_video_fps(input_file, output_file, target_fps=25):
     video.close()
 
 def extract_audio(video_file, audio_output_file, sample_rate=8000):
+    """Extracts raw WAV audio from MP4."""
     video = VideoFileClip(video_file)
     video.audio.write_audiofile(audio_output_file, fps=sample_rate, nbytes=2, codec='pcm_s16le', logger=None)
     video.close()
 
 def merge_video_audio(video_file, audio_file, output_file):
+    """Creates final video with isolated audio track."""
     video = VideoFileClip(video_file)
     audio = AudioFileClip(audio_file)
     set_audio_fn = getattr(video, "set_audio", getattr(video, "with_audio", None))
@@ -514,6 +637,24 @@ def merge_video_audio(video_file, audio_file, output_file):
     final_video.close()
 
 def process_video(input_file, output_path, number_of_speakers, detect_every_N_frame, scalar_face_detection, config_path, audio_weights, video_weights, sdk_path, license_path):
+    """
+    Main execution pipeline for AV-ConvTasNet offline inference.
+    
+    Args:
+        input_file (str): Input MP4 video path.
+        output_path (str): Output save directory.
+        number_of_speakers (int): Number of sources to extract.
+        detect_every_N_frame (int): SDK detection parameter.
+        scalar_face_detection (float): Face crop box multiplier.
+        config_path (str): AV-ConvTasNet YAML architecture.
+        audio_weights (str): Weights for audio component.
+        video_weights (str): Weights for ResNet video component.
+        sdk_path (str): BlueSkeye SDK directory.
+        license_path (str): BlueSkeye license file.
+        
+    Returns:
+        list: File paths of separated videos.
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.backends.mps.is_available():
         # Fallback to CPU if MPS gives issues, AV-ConvTasNet might have 3D convolutions not supported on MPS
@@ -530,18 +671,21 @@ def process_video(input_file, output_path, number_of_speakers, detect_every_N_fr
     temp_25fps_file = os.path.join(output_path, 'temp_25fps.mp4')
     convert_video_fps(input_file, temp_25fps_file, target_fps=TARGET_FPS)
     
+    # 1. SDK Video Tracking
     filename_path = detectface(temp_25fps_file, output_path, detect_every_N_frame, scalar_face_detection, number_of_speakers, api, image_type)
     
+    # 2. Audio Extraction
     audio_output = os.path.join(output_path, 'audio.wav')
     extract_audio(temp_25fps_file, audio_output, sample_rate=AUDIO_SAMPLE_RATE)
     
-    # Copy assets
+    # Copy assets for landmark alignment
     dolphin_assets = '/Users/rohit/Desktop/avss/dolphin/bskai_demo/assets'
     local_assets = os.path.join(os.path.dirname(__file__), 'assets')
     if not os.path.exists(local_assets) and os.path.exists(dolphin_assets):
         import shutil
         shutil.copytree(dolphin_assets, local_assets)
         
+    # 3. Mouth Extraction (Grayscale for AV-ConvTasNet frontend)
     crop_mouth(os.path.join(output_path, "faces"), 
                os.path.join(output_path, "landmark"), 
                filename_path, 
@@ -549,11 +693,12 @@ def process_video(input_file, output_path, number_of_speakers, detect_every_N_fr
                convert_gray=True, 
                testset_only=False)
     
+    # 4. Architecture Instantiation
     print(f"[System] Loading architecture config from: {config_path}")
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Initialize Video Model
+    # Initialize Video Model (ResNet18)
     videomodel = video(**config['video_model'])
     if video_weights and os.path.exists(video_weights):
         if os.path.getsize(video_weights) < 1000:
@@ -579,6 +724,7 @@ def process_video(input_file, output_path, number_of_speakers, detect_every_N_fr
     audiomodel.to(device)
     audiomodel.eval()
     
+    # 5. Segmented Inference Loop (Overlap-Add)
     with torch.no_grad():
         for i in range(number_of_speakers):
             mouth_roi = np.load(os.path.join(output_path, "mouthroi", f"speaker{i+1}.npz"))["data"]
@@ -596,6 +742,7 @@ def process_video(input_file, output_path, number_of_speakers, detect_every_N_fr
             hop_size = int(HOP_SIZE_SEC * sr)
             all_estimates = []
             
+            # Sliding window execution
             start_idx = 0
             while start_idx < len(mix):
                 end_idx = min(start_idx + window_size, len(mix))
@@ -606,6 +753,7 @@ def process_video(input_file, output_path, number_of_speakers, detect_every_N_fr
                     pad = torch.zeros(window_size - len(window_mix))
                     window_mix = torch.cat((window_mix, pad))
                     
+                # Match temporal space for video frames
                 start_frame = int(start_idx / sr * TARGET_FPS)
                 end_frame = int(end_idx / sr * TARGET_FPS)
                 end_frame = min(end_frame, len(mouth_roi))
@@ -615,7 +763,7 @@ def process_video(input_file, output_path, number_of_speakers, detect_every_N_fr
                     start_idx += hop_size
                     continue
                 
-                # Execute in strict isolation to prevent memory tethering
+                # Execute isolation logic
                 isolated_numpy_result = process_single_chunk_isolated(
                     audiomodel, videomodel, window_mix, window_mouth_roi, device
                 )
@@ -641,6 +789,7 @@ def process_video(input_file, output_path, number_of_speakers, detect_every_N_fr
                 start_idx += hop_size
                 if start_idx >= len(mix): break
             
+            # 6. Overlap-Add Reconstruction
             output_length = len(mix)
             merged_output = torch.zeros(1, output_length)
             weights = torch.zeros(output_length)
@@ -669,6 +818,7 @@ def process_video(input_file, output_path, number_of_speakers, detect_every_N_fr
             # Save the final estimated audio
             torchaudio.save(os.path.join(output_path, f"speaker{i+1}_est.wav"), merged_output, sr)
 
+    # 7. Merge final videos
     output_files = []
     for i in range(number_of_speakers):
         video_input = os.path.join(output_path, f"video_tracked{i+1}.mp4")

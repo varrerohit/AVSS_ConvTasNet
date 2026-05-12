@@ -1,12 +1,26 @@
+"""
+Real-time Audio-Visual Speech Separation using AV-ConvTasNet and BlueSkeye SDK.
+
+This script demonstrates a real-time inference pipeline. It continuously captures
+frames from a video, tracks and aligns speaker faces using the BlueSkeye SDK,
+and pushes the cropped mouth sequences and audio chunks to the AV-ConvTasNet
+model. It uses a sliding-window overlap-add methodology to reconstruct the audio.
+"""
+
 import warnings
 warnings.filterwarnings("ignore")
-import os, argparse, sys, gc, time
+import os
+import argparse
+import sys
+import gc
+import time
 import torch
 import torch.nn.functional as F
 import numpy as np
-import cv2, yaml, torchaudio
+import cv2
+import yaml
+import torchaudio
 import soundfile as sf
-from PIL import Image
 from collections import deque
 from skimage import transform as tf
 
@@ -16,15 +30,18 @@ from model.av_model import AV_model
 from model.video_model import video
 
 # --- APPLE SILICON MPS PATCH ---
+# Custom pooling wrappers to avoid MPS backend errors on Mac
 _orig_adaptive_avg_pool1d = F.adaptive_avg_pool1d
 _orig_adaptive_avg_pool2d = F.adaptive_avg_pool2d
 
 def _mps_safe_adaptive_avg_pool1d(input, output_size):
+    """Safely executes adaptive average pooling 1D."""
     if input.device.type == 'mps':
         return _orig_adaptive_avg_pool1d(input.cpu(), output_size).to(input.device)
     return _orig_adaptive_avg_pool1d(input, output_size)
 
 def _mps_safe_adaptive_avg_pool2d(input, output_size):
+    """Safely executes adaptive average pooling 2D."""
     if input.device.type == 'mps':
         return _orig_adaptive_avg_pool2d(input.cpu(), output_size).to(input.device)
     return _orig_adaptive_avg_pool2d(input, output_size)
@@ -44,6 +61,9 @@ MOUTH_CROP_WIDTH = 112
 # MODEL LOAD UTILS
 # ==========================================
 def load_state_dict_in(model, pretrained_dict):
+    """
+    Loads specific keys from a pretrained state dictionary into the model.
+    """
     model_dict = model.state_dict()
     update_dict = {}
     for k, v in pretrained_dict.items():
@@ -54,6 +74,9 @@ def load_state_dict_in(model, pretrained_dict):
     return model
 
 def update_parameter(model, pretrained_dict):
+    """
+    Updates the video frontend (ResNet18) parameters and freezes them.
+    """
     model_dict = model.state_dict()
     update_dict = {}
     for k, v in pretrained_dict.items():
@@ -71,6 +94,16 @@ def update_parameter(model, pretrained_dict):
     return model
 
 def CenterCrop(batch_img, size):
+    """
+    Applies a center crop to a batch of video frames.
+    
+    Args:
+        batch_img (np.ndarray): Tensor of shape (B, D, H, W).
+        size (tuple): Target (Height, Width).
+        
+    Returns:
+        np.ndarray: Cropped sequence.
+    """
     h, w = batch_img[0][0].shape[0], batch_img[0][0].shape[1]
     th, tw = size
     img = np.zeros((len(batch_img), len(batch_img[0]), th, tw))
@@ -81,12 +114,18 @@ def CenterCrop(batch_img, size):
     return img
 
 def ColorNormalize(batch_img):
+    """
+    Standardizes image values to a specific mean and standard deviation.
+    """
     mean = 0.361858
     std = 0.147485
     batch_img = (batch_img - mean) / std
     return batch_img
 
 def init_sdk(sdk_path, license_path):
+    """
+    Initializes the BlueSkeye SDK for real-time tracking.
+    """
     sys.path.insert(0, os.path.join(sdk_path, "python"))
     if "BSocial" in sdk_path:
         from BMBSocial import BMBSocialAPI, BSocialImageType
@@ -103,6 +142,9 @@ def init_sdk(sdk_path, license_path):
     return api, image_type
 
 def bb_intersection_over_union(boxA, boxB):
+    """
+    Calculates IoU for continuous bounding box tracking.
+    """
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
     xB = min(boxA[2], boxB[2])
@@ -115,6 +157,7 @@ def bb_intersection_over_union(boxA, boxB):
     return interArea / float(boxAArea + boxBArea - interArea)
 
 def warp_img(src, dst, img, std_size):
+    """Warps an image via similarity transform based on landmarks."""
     tform = tf.estimate_transform('similarity', src, dst) 
     warped = tf.warp(img, inverse_map=tform.inverse, output_shape=std_size) 
     warped = warped * 255 
@@ -122,12 +165,14 @@ def warp_img(src, dst, img, std_size):
     return warped, tform
 
 def apply_transform(transform, img, std_size):
+    """Applies an existing transform to an image."""
     warped = tf.warp(img, inverse_map=transform.inverse, output_shape=std_size)
     warped = warped * 255 
     warped = warped.astype('uint8')
     return warped
 
 def cut_patch(img, landmarks, height, width, threshold=5):
+    """Safely extracts a rectangular region centered around landmarks."""
     center_x, center_y = np.mean(landmarks, axis=0)
     center_y = max(height, min(img.shape[0] - height, center_y))
     center_x = max(width, min(img.shape[1] - width, center_x))
@@ -136,8 +181,24 @@ def cut_patch(img, landmarks, height, width, threshold=5):
     return cutted_img
 
 def process_single_chunk_isolated(audiomodel, videomodel, mix_chunk, roi_chunk, device):
+    """
+    Processes a single time-window of audio and video while enforcing strict 
+    memory cleanup to avoid accumulation in the MPS/CUDA graph.
+    
+    Args:
+        audiomodel: AV-ConvTasNet model.
+        videomodel: Video ResNet model.
+        mix_chunk: Audio tensor.
+        roi_chunk: Video NumPy array.
+        device: Target execution device.
+        
+    Returns:
+        np.ndarray: Detached NumPy array of the output audio chunk.
+    """
+    # Audio prep
     mix_input = mix_chunk[None].to(device)
     
+    # Video prep (crop, normalize, reshape)
     mouth = roi_chunk[None]
     mouth = CenterCrop(mouth, (112, 112))
     mouth = ColorNormalize(mouth)
@@ -145,11 +206,14 @@ def process_single_chunk_isolated(audiomodel, videomodel, mix_chunk, roi_chunk, 
     mouth = np.reshape(mouth, (B, 1, D, H, W))
     mouth = torch.from_numpy(mouth).type(torch.float32).to(device)
     
+    # Forward pass
     mouth_emb = videomodel(mouth)
     est_sources = audiomodel(mix_input, mouth_emb)
     
+    # Extract to pure CPU format
     numpy_result = est_sources.detach().cpu().numpy().copy()
     
+    # Immediate garbage collection of tensors
     del est_sources
     del mouth_emb
     del mix_input
@@ -158,6 +222,20 @@ def process_single_chunk_isolated(audiomodel, videomodel, mix_chunk, roi_chunk, 
     return numpy_result
 
 def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, license_path, config_path, audio_weights, video_weights, device_type):
+    """
+    Simulates real-time inference by maintaining a rolling buffer of frames.
+    
+    Args:
+        input_video (str): Path to input video file.
+        output_dir (str): Directory for output media.
+        number_of_speakers (int): Number of speakers.
+        sdk_path (str): BlueSkeye SDK directory.
+        license_path (str): SDK license path.
+        config_path (str): Architecture config path.
+        audio_weights (str): Audio model weights.
+        video_weights (str): Video model weights.
+        device_type (str): Requested execution device.
+    """
     device = torch.device(device_type if torch.cuda.is_available() else 'cpu')
     print(f"[System] AI Device: {device}")
     
@@ -167,6 +245,7 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
     api.set_inference_increment_enabled(False)
     api.set_log_level(0)
 
+    # 1. Model Initialization
     print(f"[System] Loading architecture config from: {config_path}")
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -187,12 +266,14 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
     audiomodel.to(device)
     audiomodel.eval()
     
+    # 2. Template matching initialization
     try:
         mean_face_landmarks = np.load(os.path.join(os.path.dirname(__file__), '../bskai_demo/assets/20words_mean_face.npy'))
     except:
         print("[Warning] mean_face.npy not found. Mouth crops may be unaligned.")
         mean_face_landmarks = None
 
+    # 3. Media Pipeline Setup
     from moviepy import VideoFileClip
     video_clip = VideoFileClip(input_video)
     if video_clip.fps != TARGET_FPS:
@@ -237,8 +318,10 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
     
     stablePntsIDs = [33, 36, 39, 42, 45]
     
+    # Data queues
     rolling_mouths = [deque(maxlen=max_rolling_frames) for _ in range(number_of_speakers)]
     
+    # Lookahead buffer for landmark smoothing
     window_margin = 12
     lookahead_frames = []
     lookahead_lnds = [[] for _ in range(number_of_speakers)]
@@ -261,17 +344,23 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
     rolling_boxes = [deque(maxlen=max_rolling_frames) for _ in range(number_of_speakers)]
     
     def process_buffered_frame(cur_frame_rgb, cur_boxes, cur_lnds, is_draining=False):
+        """
+        Pulls a single frame from the queue, processes mouth extraction, and
+        dispatches inference to the model if the temporal window threshold is met.
+        """
         nonlocal frames_processed_total, frames_since_last_inference, current_start_audio_idx, current_end_audio_idx, next_inference_frame, processing_time_acc, fps_display
         
         for s in range(number_of_speakers):
             cur_box = cur_boxes[s]
             cur_lnd = cur_lnds[s]
             
+            # Smoothing
             if not is_draining:
                 smoothed_lnd = np.mean(lookahead_lnds[s], axis=0)
             else:
                 smoothed_lnd = cur_lnd 
                 
+            # Face extraction
             if mean_face_landmarks is not None and np.sum(cur_lnd) > 0:
                 if not is_draining:
                     trans_frame, trans = warp_img(smoothed_lnd[stablePntsIDs, :], mean_face_landmarks[stablePntsIDs, :], cur_frame_rgb, (256, 256))
@@ -300,6 +389,7 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
         frames_processed_total += 1
         frames_since_last_inference += 1
         
+        # Inference threshold met
         if frames_processed_total == next_inference_frame:
             t2 = time.time()
             
@@ -325,6 +415,7 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
                 elif est_audio_tensor.ndim == 1:
                     est_audio_tensor = est_audio_tensor[None, :]
 
+                # Reconstruct output using Hanning overlap-add
                 valid_len = min(window_size, audio_out_buffers[s].size(0) - current_start_audio_idx)
                 if valid_len > 0:
                     est_data = est_audio_tensor[0, :valid_len]
@@ -350,6 +441,7 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
             current_end_audio_idx = current_start_audio_idx + window_size
             next_inference_frame = int(current_end_audio_idx / AUDIO_SAMPLE_RATE * TARGET_FPS)
 
+        # Output video writing
         for s in range(number_of_speakers):
             f_img = cur_frame_bgr.copy()
             box = rolling_boxes[s][-1]
@@ -358,6 +450,7 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
             cv2.putText(f_img, f"End-to-End FPS: {fps_display:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             out_video_writers[s].write(f_img)
 
+    # 4. Main capturing loop
     while cap.isOpened():
         t0 = time.time()
         ret, frame_bgr = cap.read()
@@ -393,6 +486,7 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
         speaker_boxes = [None] * number_of_speakers
         speaker_lnds = [None] * number_of_speakers
         
+        # IoU tracking algorithm
         if frames_read == 0:
             for s in range(number_of_speakers):
                 if s < len(detected_boxes):
@@ -435,6 +529,7 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
         t1 = time.time()
         processing_time_acc += (t1 - t0)
 
+        # Buffer control
         if len(lookahead_frames) == window_margin:
             cur_frame_rgb = lookahead_frames.pop(0)
             cur_boxes = [lookahead_boxes[s].pop(0) for s in range(number_of_speakers)]
@@ -443,6 +538,7 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
 
         frames_read += 1
 
+    # 5. Pipeline Draining
     while len(lookahead_frames) > 0:
         cur_frame_rgb = lookahead_frames.pop(0)
         cur_boxes = [lookahead_boxes[s].pop(0) for s in range(number_of_speakers)]
@@ -452,6 +548,7 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
         process_buffered_frame(cur_frame_rgb, cur_boxes, cur_lnds, is_draining=True)
         processing_time_acc += (time.time() - t0)
 
+    # Process remaining audio chunk
     if frames_since_last_inference > 0:
         if current_end_audio_idx <= len(mix_audio):
             win_audio = mix_audio[current_start_audio_idx:current_end_audio_idx]
@@ -498,6 +595,7 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
     print("\n[System] Saving complete WAV files and merging with Video...")
     from moviepy import VideoFileClip, AudioFileClip
     
+    # Final normalization and merge
     for s in range(number_of_speakers):
         final_wav_path = os.path.join(output_dir, f"speaker_{s+1}_realtime_output.wav")
         final_mp4_path = os.path.join(output_dir, f"speaker_{s+1}_realtime_output.mp4")
@@ -520,16 +618,16 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
     if os.path.exists(temp_audio_wav): os.remove(temp_audio_wav)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--input', type=str, required=True)
-    parser.add_argument('-o', '--output', type=str, required=True)
-    parser.add_argument('-s', '--speakers', type=int, default=2)
-    parser.add_argument('--config', type=str, required=True)
-    parser.add_argument('--audio-weights', type=str, required=True)
-    parser.add_argument('--video-weights', type=str, required=True)
-    parser.add_argument("-sdk", "--sdk-path", required=True)
-    parser.add_argument("-l", "-lic", "--license-path", required=True)
-    parser.add_argument("--device", type=str, default='cpu')
+    parser = argparse.ArgumentParser(description="Real-time Speaker Separation using AV-ConvTasNet")
+    parser.add_argument('-i', '--input', type=str, required=True, help='Path to input video')
+    parser.add_argument('-o', '--output', type=str, required=True, help='Path to output directory')
+    parser.add_argument('-s', '--speakers', type=int, default=2, help='Number of speakers')
+    parser.add_argument('--config', type=str, required=True, help='Path to config YAML')
+    parser.add_argument('--audio-weights', type=str, required=True, help='Path to AV-ConvTasNet weights')
+    parser.add_argument('--video-weights', type=str, required=True, help='Path to ResNet weights')
+    parser.add_argument("-sdk", "--sdk-path", required=True, help='Path to BlueSkeye SDK')
+    parser.add_argument("-l", "-lic", "--license-path", required=True, help='Path to SDK License')
+    parser.add_argument("--device", type=str, default='cpu', help='Device for inference')
     args = parser.parse_args()
     
     process_realtime(args.input, args.output, args.speakers, args.sdk_path, args.license_path, args.config, args.audio_weights, args.video_weights, args.device)
