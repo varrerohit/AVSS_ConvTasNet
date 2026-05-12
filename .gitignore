@@ -1,1 +1,9 @@
-*.pyccheckpoints/
+*.pyc
+checkpoints//
+
+checkpoints/
+*.pt
+*.ckpt
+*.pth
+__pycache__/
+*.pyc
