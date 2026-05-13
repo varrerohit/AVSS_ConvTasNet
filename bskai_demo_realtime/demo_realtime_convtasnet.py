@@ -236,7 +236,12 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
         video_weights (str): Video model weights.
         device_type (str): Requested execution device.
     """
-    device = torch.device(device_type if torch.cuda.is_available() else 'cpu')
+    if device_type == 'mps' and torch.backends.mps.is_available():
+        device = torch.device('mps')
+    elif device_type == 'cuda' and torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
     print(f"[System] AI Device: {device}")
     
     api, image_type = init_sdk(sdk_path, license_path)
@@ -274,11 +279,21 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
         mean_face_landmarks = None
 
     # 3. Media Pipeline Setup
+    global TARGET_FPS
     from moviepy import VideoFileClip
     video_clip = VideoFileClip(input_video)
+    
+    cap = cv2.VideoCapture(input_video)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    if video_fps > 0:
+        TARGET_FPS = video_fps
+        print(f"[System] Dynamic FPS allocation: {TARGET_FPS} fps")
+    
     if video_clip.fps != TARGET_FPS:
         print(f"[Warning] Video FPS is {video_clip.fps}, expected {TARGET_FPS}. Sync might be off.")
-    
+
     os.makedirs(output_dir, exist_ok=True)
     temp_audio_wav = os.path.join(output_dir, "temp_in.wav")
     video_clip.audio.write_audiofile(temp_audio_wav, fps=AUDIO_SAMPLE_RATE, nbytes=2, codec='pcm_s16le', logger=None)
@@ -289,10 +304,6 @@ def process_realtime(input_video, output_dir, number_of_speakers, sdk_path, lice
         resampler = torchaudio.transforms.Resample(sr, AUDIO_SAMPLE_RATE)
         mix_audio = resampler(mix_audio)
         sr = AUDIO_SAMPLE_RATE
-
-    cap = cv2.VideoCapture(input_video)
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out_video_writers = []
