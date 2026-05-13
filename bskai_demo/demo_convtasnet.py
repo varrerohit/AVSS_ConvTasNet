@@ -82,8 +82,16 @@ def load_state_dict_in(model, pretrained_dict):
     for k, v in pretrained_dict.items():
         if 'av_model' in k:
             update_dict[k[9:]] = v
+        # Fallback for keys that match exactly
+        elif k in model_dict:
+            update_dict[k] = v
+            
+    if len(update_dict) == 0:
+        raise RuntimeError("CRITICAL ERROR: No matching keys found in the audio checkpoint! The model is randomly initialized, which will result in noise. Please verify you have the correct AV-ConvTasNet weights.")
+        
     model_dict.update(update_dict)
     model.load_state_dict(model_dict)
+    print(f"[System] Successfully loaded {len(update_dict)}/{len(model_dict)} parameters into AV_model.")
     return model
 
 def update_parameter(model, pretrained_dict):
