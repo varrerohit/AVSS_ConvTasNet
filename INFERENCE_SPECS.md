@@ -27,3 +27,15 @@
 ## Inference Strategy
 - **Execution:** Feed mouth ROI to `videomodel` to get embeddings, then feed embeddings + audio to `audiomodel`.
 - **Overlap-Add:** Hann window cross-fading for 4-second chunks.
+
+## ⚠️ Known Issue: Official Pretrained Weights
+As of May 2026, the pretrained model links provided in the **[Official AV-ConvTasNet Repository](https://github.com/JusperLee/AV-ConvTasNet#usage)** are incorrect. 
+
+The Google Drive links provided by the author for LRS2, LRS3, and VoxCeleb2 point to **CTCNet** checkpoints rather than AV-ConvTasNet checkpoints. Because CTCNet uses Spatial Pyramid Pooling Depthwise (`spp_dw`) layers and the Asteroid framework, the keys in those `.ckpt` files (e.g., `masker.video_block.video.0.spp_dw.0.conv.weight`) do not match the `AV_model` architecture defined in this repository (which expects keys like `video.conv1d_list.0.dconv.weight`).
+
+If you attempt to load the currently linked weights, `load_state_dict_in` will explicitly throw a `RuntimeError` to prevent the model from executing with random noise.
+
+To track the resolution of this issue or to obtain the correct weights, please refer to the corresponding GitHub issue: 
+**[Issue: Incorrect Pretrained Models linked in README](https://github.com/JusperLee/AV-ConvTasNet/issues)** *(Link placeholder until issue is officially filed).*
+
+Currently, to use this specific model, you must train it from scratch using the provided `Trainer/train.py` script. Alternatively, you can use the **Swift-Net** or **Dolphin** models provided in the adjacent directories, as their pretrained weights are accurate and functioning.
